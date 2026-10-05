@@ -3,4 +3,4 @@ uvicorn
 pymupdf
 lxml
 python-multipart
-mangum
+jinja2
