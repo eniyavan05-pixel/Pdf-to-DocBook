@@ -3,6 +3,7 @@ import os
 import sys
 import re
 import uuid
+import tempfile
 from datetime import datetime
 from typing import List, Dict
 import pymupdf
@@ -11,17 +12,13 @@ from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
-if getattr(sys, 'frozen', False):
-    BASE_DIR = sys._MEIPASS
-else:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Correct template path resolution for Vercel's api/ structure
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATES_DIR = os.path.join(BASE_DIR, "..", "templates")
 
-TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
-UPLOADS_DIR = os.path.join(os.getcwd(), "uploads")
-OUTPUTS_DIR = os.path.join(os.getcwd(), "outputs")
-
-os.makedirs(UPLOADS_DIR, exist_ok=True)
-os.makedirs(OUTPUTS_DIR, exist_ok=True)
+# Serverless-safe temporary directories using /tmp via tempfile
+UPLOADS_DIR = tempfile.gettempdir()
+OUTPUTS_DIR = tempfile.gettempdir()
 
 app = FastAPI(title="TTBS XML Studio - DocBook 5.0 Suite")
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
