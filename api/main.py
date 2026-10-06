@@ -42,6 +42,18 @@ NUMBER_PREFIXES = {
     "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety", "well", "all"
 }
 
+# ---- Notes / footnote handling -------------------------------------------
+# Heading that opens an end-notes list (NOTES, Notes, ENDNOTES ...)
+NOTES_HEADING_REGEX = re.compile(r'^(?:end\s*)?notes$', re.IGNORECASE)
+# A note starts with "12." (digits + dot, not a decimal such as 3.5)
+NOTE_START_REGEX = re.compile(r'^\s*(\d{1,4})\s*\.(?!\d)\s*')
+# Lines that end an end-notes list
+NOTES_EXIT_REGEX = re.compile(r'^CHAPTER\s+\d+\b', re.IGNORECASE)
+# URLs inside note text (stops before hex entities such as &#x201D;)
+URL_REGEX = re.compile(r'(?:https?://|www\.)(?:[^\s<>"&]|&(?!#x[0-9A-Fa-f]+;))+', re.IGNORECASE)
+FOOTNOTE_ROLE = "end-bk-note"
+KEEP_NOTES_SECTION = False   # True = also keep the NOTES list as a normal section
+
 def resource_path(relative_path):
     try:
         base_path = sys._MEIPASS
@@ -100,7 +112,10 @@ def fix_missing_boundary_spaces(text):
     if not text:
         return ""
     text = re.sub(r'([,;])([A-Za-z])', r'\1 \2', text)
+    
+    # Heal accidental spaces between hex entities and trailing word parts (e.g., Mu&#x00F1; oz -> Mu&#x00F1;oz)
     text = re.sub(r'(&#x[0-9A-Fa-f]{4,6};)\s+([a-z]{1,4}\b)', r'\1\2', text)
+    
     text = re.sub(r'&#x201C;\s+', '&#x201C;', text)
     text = re.sub(r'\s+&#x201D;', '&#x201D;', text)
     text = re.sub(r'&#x2019;\s*s\b', '&#x2019;s', text)
@@ -133,6 +148,15 @@ def merge_consecutive_styled_spans(span_list):
     current_style = None
 
     for span in span_list:
+        # Superscript note callout -> its own item, never merged with text
+        if span.get("note_ref"):
+            if current_text:
+                merged.append({"style": current_style, "text": current_text})
+            current_text = ""
+            current_style = None
+            merged.append({"style": "noteref", "text": span["note_ref"]})
+            continue
+
         text = clean_to_hex_entities(span.get("text", ""))
         text = fix_hyphenated_words(text)
         text = fix_missing_boundary_spaces(text)
@@ -175,13 +199,27 @@ def merge_consecutive_styled_spans(span_list):
         merged.append({"style": current_style, "text": current_text})
     return merged
 
-def append_styled_spans_to_node(target_elem, span_list, default_ns=DOCBOOK_NS):
+def append_styled_spans_to_node(target_elem, span_list, default_ns=DOCBOOK_NS, note_factory=None):
     merged_spans = merge_consecutive_styled_spans(span_list)
 
     for item in merged_spans:
         raw_text = item["text"]
         style = item["style"]
         if not raw_text:
+            continue
+
+        if style == "noteref":
+            if note_factory is not None:
+                # remove the gap space that sits between the text and the callout
+                if len(target_elem) > 0:
+                    if target_elem[-1].tail:
+                        target_elem[-1].tail = target_elem[-1].tail.rstrip(' ')
+                elif target_elem.text:
+                    target_elem.text = target_elem.text.rstrip(' ')
+                note_factory(target_elem, raw_text)
+            else:
+                sup = etree.SubElement(target_elem, f"{{{default_ns}}}superscript")
+                sup.text = raw_text
             continue
 
         leading_ws = len(raw_text) - len(raw_text.lstrip(' '))
@@ -229,6 +267,98 @@ def append_styled_spans_to_node(target_elem, span_list, default_ns=DOCBOOK_NS):
                 target_elem[-1].tail = (target_elem[-1].tail or "") + trail_str
             else:
                 target_elem.text = (target_elem.text or "") + trail_str
+
+def linkify_urls(para):
+    """Wrap URLs in <link xlink:href="..."><uri>...</uri></link>."""
+    def make_links(text):
+        pieces, links, last = [], [], 0
+        for m in URL_REGEX.finditer(text):
+            url = m.group(0)
+            trimmed = url.rstrip('.,;:)]')
+            end = m.start() + len(trimmed)
+            pieces.append(text[last:m.start()])
+            href = trimmed if re.match(r'https?://', trimmed, re.IGNORECASE) else "http://" + trimmed
+            link = etree.Element(f"{{{DOCBOOK_NS}}}link", attrib={f"{{{XLINK_NS}}}href": href})
+            etree.SubElement(link, f"{{{DOCBOOK_NS}}}uri").text = trimmed
+            links.append(link)
+            last = end
+        pieces.append(text[last:])
+        return pieces, links
+
+    for el in list(para.iter()):
+        if el is not para and el.tail and URL_REGEX.search(el.tail):
+            pieces, links = make_links(el.tail)
+            parent = el.getparent()
+            pos = parent.index(el) + 1
+            el.tail = pieces[0]
+            for i, link in enumerate(links):
+                link.tail = pieces[i + 1]
+                parent.insert(pos + i, link)
+        if el.tag == f"{{{DOCBOOK_NS}}}uri" or el.tag == f"{{{DOCBOOK_NS}}}link":
+            continue
+        if el.text and URL_REGEX.search(el.text):
+            pieces, links = make_links(el.text)
+            el.text = pieces[0]
+            for i, link in enumerate(links):
+                link.tail = pieces[i + 1]
+                el.insert(i, link)
+
+def strip_note_label(spans):
+    """Remove the leading '12. ' from the first spans of a note."""
+    joined = "".join(sp.get("text", "") for sp in spans[:6])
+    m = NOTE_START_REGEX.match(joined)
+    if not m:
+        return spans
+    n = m.end()
+    for sp in spans:
+        if n <= 0:
+            break
+        t = sp.get("text", "")
+        cut = min(n, len(t))
+        sp["text"] = t[cut:]
+        n -= cut
+    return [sp for sp in spans if sp.get("text")]
+
+def prepare_line_spans(line_spans, dominant_size, baseline_y, line_ends_with_hyphen, detect_notes=True):
+    """Classify sup/sub, flag note callouts, repair gaps and line-end hyphens."""
+    candidates = [sp["origin"][1] for sp in line_spans
+                  if "origin" in sp and sp.get("size", dominant_size) >= dominant_size * 0.85 and sp.get("text", "").strip()]
+    if candidates:
+        baseline_y = candidates[0]
+
+    out = []
+    for s_i, span in enumerate(line_spans):
+        span_copy = dict(span)
+        s_text = span_copy.get("text", "")
+        if not s_text:
+            continue
+
+        if line_ends_with_hyphen and s_i == len(line_spans) - 1:
+            span_copy["text"] = re.sub(r'[-\u2010\u2011\xad]\s*$', '', span_copy["text"])
+
+        s_size = span_copy.get("size", dominant_size)
+        s_origin_y = span_copy.get("origin", (0, baseline_y))[1]
+
+        if s_size < dominant_size * 0.85:
+            span_copy["pos_type"] = "sup" if s_origin_y < baseline_y - 1.2 else ("sub" if s_origin_y > baseline_y + 1.0 else "regular")
+        else:
+            span_copy["pos_type"] = "regular"
+
+        # superscript digits = note callout
+        if detect_notes and span_copy["pos_type"] == "sup" and re.fullmatch(r'\s*\d{1,4}\s*', s_text):
+            span_copy["note_ref"] = s_text.strip()
+
+        if s_i < len(line_spans) - 1:
+            next_span_x0 = line_spans[s_i + 1]["bbox"][0]
+            curr_span_x1 = span["bbox"][2]
+            if (next_span_x0 - curr_span_x1) > 3.5 and not span_copy["text"].endswith(" "):
+                span_copy["text"] += " "
+
+        out.append(span_copy)
+
+    if out and not line_ends_with_hyphen and not out[-1]["text"].endswith(" "):
+        out.append({"text": " ", "flags": 0, "size": dominant_size, "font": "", "pos_type": "regular"})
+    return out
 
 def is_actual_running_header(line_text, y0, page_height):
     t = line_text.strip()
@@ -287,8 +417,8 @@ def extract_pdf_pages_clean_header(pdf_path, status_callback=None):
     chapter_regex = re.compile(r'^(CHAPTER\s+\d+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN|ELEVEN|TWELVE|\d+)\b', re.IGNORECASE)
     sec_regex = re.compile(r'^(I|II|III|IV|V|VI|VII|VIII|IX|X|XI|XII)\.\s+(.*)')
     figure_regex = re.compile(r'^(Figure\s+\d+(?:\.\d+)?)\b', re.IGNORECASE)
-    note_regex = re.compile(r'^(\d+)\.\s+(.*)')
     last_folio = None
+    notes_state = {"active": False, "last_label": 0, "current": None}
 
     for idx, page in enumerate(doc, 1):
         if status_callback:
@@ -305,9 +435,6 @@ def extract_pdf_pages_clean_header(pdf_path, status_callback=None):
         text_x0s = [b["bbox"][0] for b in page_blocks if b.get("type") == 0 and b.get("lines")]
         column_base_x0 = min(text_x0s) if text_x0s else 50.0
 
-        text_x1s = [b["bbox"][2] for b in page_blocks if b.get("type") == 0 and b.get("lines")]
-        column_max_x1 = max(text_x1s) if text_x1s else (column_base_x0 + 400.0)
-
         for block in page_blocks:
             if block.get("type") != 0:
                 continue
@@ -317,15 +444,10 @@ def extract_pdf_pages_clean_header(pdf_path, status_callback=None):
 
             current_spans = []
             block_x0 = block["bbox"][0]
-            block_x1 = block["bbox"][2]
             base_x0 = lines[0]["bbox"][0]
             
-            # Precise blockquote detection: must be indented on the left AND inset on the right
-            left_indent = block_x0 - column_base_x0
-            right_inset = column_max_x1 - block_x1
-            
-            is_blockquote = left_indent > 25.0 and right_inset > 25.0
-            is_sidebar = left_indent > 15.0 and right_inset > 15.0 and not is_blockquote
+            is_blockquote = (block_x0 - column_base_x0) > 30.0
+            is_sidebar = (block_x0 - column_base_x0) > 18.0 and not is_blockquote
             is_indented = (base_x0 - column_base_x0) > 4.0
 
             prev_line_y1 = None
@@ -349,91 +471,88 @@ def extract_pdf_pages_clean_header(pdf_path, status_callback=None):
                 dominant_size = max(set(sizes), key=sizes.count) if sizes else 10.0
                 baseline_y = line_spans[0]["origin"][1] if "origin" in line_spans[0] else line["bbox"][3]
 
+                raw_line_end = "".join([s.get("text", "") for s in line_spans]).rstrip()
+                line_ends_with_hyphen = raw_line_end.endswith(('-', '\u2010', '\u2011', '\xad'))
+
+                is_chap = bool(chapter_regex.match(full_line_text) and len(full_line_text) < 40)
+                is_sec = bool(sec_regex.match(full_line_text))
+                is_fig = bool(figure_regex.match(full_line_text))
+                is_caps_title = bool(
+                    full_line_text.isupper()
+                    and any(c.isalpha() for c in full_line_text)
+                    and 3 < len(full_line_text) < 120
+                    and not full_line_text.endswith('.')
+                    and max(sizes, default=0) >= dominant_size
+                )
+
+                def flush_current():
+                    nonlocal current_spans
+                    if current_spans:
+                        b_type = "blockquote" if is_blockquote else ("sidebar" if is_sidebar else "para")
+                        blocks_list.append({
+                            "type": b_type,
+                            "spans": current_spans,
+                            "raw": "".join([s["text"] for s in current_spans]).strip(),
+                            "is_indented": is_indented
+                        })
+                        current_spans = []
+
+                # ---- start of an end-notes list ("NOTES") --------------------
+                if NOTES_HEADING_REGEX.match(full_line_text.strip()):
+                    flush_current()
+                    notes_state.update(active=True, last_label=0, current=None)
+                    blocks_list.append({"type": "notes_heading", "spans": [], "raw": full_line_text})
+                    prev_line_y1 = y1
+                    prev_line_height = line_height
+                    continue
+
+                # ---- inside an end-notes list --------------------------------
+                if notes_state["active"]:
+                    leaves_notes = bool(NOTES_EXIT_REGEX.match(full_line_text)) or (is_caps_title and len(full_line_text) >= 6)
+                    if not leaves_notes:
+                        prepared = prepare_line_spans(line_spans, dominant_size, baseline_y,
+                                                      line_ends_with_hyphen, detect_notes=False)
+                        m = NOTE_START_REGEX.match(full_line_text)
+                        label = int(m.group(1)) if m else None
+                        if m and (notes_state["last_label"] == 0 or label == 1 or label == notes_state["last_label"] + 1):
+                            item = {"type": "note_item", "label": str(label), "spans": [], "raw": ""}
+                            blocks_list.append(item)
+                            notes_state["last_label"] = label
+                            notes_state["current"] = item
+                            prepared = strip_note_label(prepared)
+                        else:
+                            item = notes_state["current"]     # continuation line (may be on an earlier page)
+                        if item is not None:
+                            item["spans"].extend(prepared)
+                            item["raw"] = "".join(sp["text"] for sp in item["spans"]).strip()
+                        prev_line_y1 = y1
+                        prev_line_height = line_height
+                        continue
+                    notes_state.update(active=False, current=None)
+
                 line_x0 = line["bbox"][0]
                 line_is_indented = (line_x0 - base_x0) > 4.0
                 has_vertical_block_gap = (prev_line_y1 is not None) and ((y0 - prev_line_y1) > (prev_line_height * 0.35))
 
                 if (line_is_indented or has_vertical_block_gap) and current_spans:
-                    b_type = "blockquote" if is_blockquote else ("sidebar" if is_sidebar else "para")
-                    blocks_list.append({
-                        "type": b_type, 
-                        "spans": current_spans, 
-                        "raw": "".join([s["text"] for s in current_spans]).strip(),
-                        "is_indented": is_indented
-                    })
-                    current_spans = []
+                    flush_current()
                     base_x0 = line_x0
 
-                raw_line_end = "".join([s.get("text", "") for s in line_spans]).rstrip()
-                line_ends_with_hyphen = raw_line_end.endswith(('-', '‐', '‑', '\xad'))
-
-                for s_i, span in enumerate(line_spans):
-                    span_copy = dict(span)
-                    s_text = span_copy.get("text", "")
-                    if not s_text:
-                        continue
-
-                    if line_ends_with_hyphen and s_i == len(line_spans) - 1:
-                        span_copy["text"] = re.sub(r'[-‐‑\xad]\s*$', '', span_copy["text"])
-
-                    s_size = span_copy.get("size", dominant_size)
-                    s_origin_y = span_copy.get("origin", (0, baseline_y))[1]
-
-                    if s_size < dominant_size * 0.85:
-                        span_copy["pos_type"] = "sup" if s_origin_y < baseline_y - 1.2 else ("sub" if s_origin_y > baseline_y + 1.0 else "regular")
-                    else:
-                        span_copy["pos_type"] = "regular"
-
-                    if s_i < len(line_spans) - 1:
-                        next_span_x0 = line_spans[s_i + 1]["bbox"][0]
-                        curr_span_x1 = span["bbox"][2]
-                        if (next_span_x0 - curr_span_x1) > 3.5 and not span_copy["text"].endswith(" "):
-                            span_copy["text"] += " "
-
-                    current_spans.append(span_copy)
-
-                if current_spans and not line_ends_with_hyphen:
-                    if not current_spans[-1]["text"].endswith(" "):
-                        current_spans.append({"text": " ", "flags": 0, "size": dominant_size, "font": "", "pos_type": "regular"})
-
-                is_chap = bool(chapter_regex.match(full_line_text) and len(full_line_text) < 40)
-                is_sec = bool(sec_regex.match(full_line_text))
-                is_fig = bool(figure_regex.match(full_line_text))
-                is_note = bool(y0 > page_height - 120 and note_regex.match(full_line_text))
-                is_caps_title = bool(
-                    full_line_text.isupper() 
-                    and any(c.isalpha() for c in full_line_text) 
-                    and 3 < len(full_line_text) < 120 
-                    and not full_line_text.endswith('.')
-                    and max(sizes, default=0) >= dominant_size
-                )
-
-                if is_chap or is_sec or is_fig or is_note or is_caps_title:
-                    if current_spans:
-                        b_type = "blockquote" if is_blockquote else ("sidebar" if is_sidebar else "para")
-                        blocks_list.append({
-                            "type": b_type, 
-                            "spans": current_spans, 
-                            "raw": "".join([s["text"] for s in current_spans]).strip(),
-                            "is_indented": is_indented
-                        })
-                        current_spans = []
-                    
+                if is_chap or is_sec or is_fig or is_caps_title:
+                    flush_current()
                     if is_chap:
                         kind = "chap_title"
                     elif is_fig:
                         kind = "figure"
-                    elif is_note:
-                        kind = "note"
                     else:
                         kind = "heading"
-
                     blocks_list.append({"type": kind, "spans": line_spans, "raw": full_line_text})
                     base_x0 = line_x0
                     prev_line_y1 = y1
                     prev_line_height = line_height
                     continue
 
+                current_spans.extend(prepare_line_spans(line_spans, dominant_size, baseline_y, line_ends_with_hyphen))
                 prev_line_y1 = y1
                 prev_line_height = line_height
 
@@ -449,6 +568,65 @@ def extract_pdf_pages_clean_header(pdf_path, status_callback=None):
         page_records.append({"page_num": str(detected_page_folio), "blocks": blocks_list})
 
     return page_records
+
+def attach_notes(callouts, note_groups):
+    """Fill every inline <footnote> with the matching entry of the NOTES list."""
+    by_chap = {}
+    for c in callouts:
+        by_chap.setdefault(c["chapter"], []).append(c)
+    chap_order = sorted(by_chap)
+    used_items = set()
+
+    def fill(chapter_callouts, group):
+        for c in chapter_callouts:
+            if c["done"]:
+                continue
+            for it in group:
+                if it["label"] == c["label"] and id(it) not in used_items:
+                    p = c["elem"].find(f"{{{DOCBOOK_NS}}}para")
+                    append_styled_spans_to_node(p, it["spans"])
+                    linkify_urls(p)
+                    used_items.add(id(it))
+                    c["done"] = True
+                    break
+
+    # 1) numbering restarts per chapter: match each list to the chapter whose callouts fit it best
+    leftover, ptr = [], 0
+    for group in note_groups:
+        glabels = {it["label"] for it in group}
+        best, best_score = None, 0.0
+        for ci in chap_order[ptr:]:
+            clabels = {c["label"] for c in by_chap[ci]}
+            score = len(glabels & clabels) / max(len(glabels | clabels), 1)
+            if score > best_score:
+                best, best_score = ci, score
+            if score == 1.0:
+                break
+        if best is not None and best_score >= 0.5:
+            ptr = chap_order.index(best) + 1
+            fill(by_chap[best], group)
+        else:
+            leftover.append(group)
+
+    # 2) continuous numbering across the book: match by label alone
+    for group in leftover:
+        for ci in chap_order:
+            fill(by_chap[ci], group)
+
+    # 3) callouts with no note found keep a plain superscript so nothing is lost
+    missing = 0
+    for c in callouts:
+        if not c["done"]:
+            missing += 1
+            fn = c["elem"]
+            parent = fn.getparent()
+            sup = etree.Element(f"{{{DOCBOOK_NS}}}superscript")
+            sup.text = c["label"]
+            sup.tail = fn.tail
+            parent.replace(fn, sup)
+    total_notes = sum(len(g) for g in note_groups)
+    return {"callouts": len(callouts), "notes": total_notes,
+            "unmatched_callouts": missing, "unused_notes": total_notes - len(used_items)}
 
 def parse_full_pdf(pdf_path, output_xml_path, doi, book_title, status_callback=None):
     if status_callback:
@@ -506,6 +684,18 @@ def parse_full_pdf(pdf_path, output_xml_path, doi, book_title, status_callback=N
     prev_block_type = "chap_title"
     in_front_matter = True
 
+    callouts = []        # every inline footnote created from a superscript callout
+    note_groups = []     # one list of notes per NOTES section
+
+    def make_footnote(parent, label):
+        fn = etree.SubElement(parent, f"{{{DOCBOOK_NS}}}footnote", attrib={
+            f"{{{XML_NS}}}id": next_id(),
+            "label": label,
+            "role": FOOTNOTE_ROLE
+        })
+        etree.SubElement(fn, f"{{{DOCBOOK_NS}}}para", attrib={f"{{{XML_NS}}}id": next_id()})
+        callouts.append({"chapter": chap_count, "label": label, "elem": fn, "done": False})
+
     for precord in page_records:
         page_num = precord["page_num"]
         page_pi = etree.ProcessingInstruction("page", f'value="{page_num}"')
@@ -532,6 +722,16 @@ def parse_full_pdf(pdf_path, output_xml_path, doi, book_title, status_callback=N
                 prev_block_type = "chap_title"
                 continue
 
+            # ---- end-notes list: collected, then moved inline as <footnote> ----
+            if b_type == "notes_heading":
+                note_groups.append([])
+                continue
+            if b_type == "note_item":
+                if not note_groups or (block["label"] == "1" and note_groups[-1]):
+                    note_groups.append([])
+                note_groups[-1].append(block)
+                continue
+
             if in_front_matter:
                 target_container = preface_elem
                 if "contents" in raw_txt.lower():
@@ -540,7 +740,7 @@ def parse_full_pdf(pdf_path, output_xml_path, doi, book_title, status_callback=N
                 if not page_pi_added:
                     p.append(page_pi)
                     page_pi_added = True
-                append_styled_spans_to_node(p, block["spans"])
+                append_styled_spans_to_node(p, block["spans"], note_factory=make_footnote)
                 continue
 
             if current_chapter is None:
@@ -588,25 +788,13 @@ def parse_full_pdf(pdf_path, output_xml_path, doi, book_title, status_callback=N
                     "fileref": f"images/fig{fig_count}.jpg"
                 })
                 prev_block_type = "figure"
-            elif b_type == "note":
-                note_elem = etree.SubElement(active_parent, f"{{{DOCBOOK_NS}}}footnote", attrib={
-                    "role": "end-ch-note",
-                    "label": "1",
-                    f"{{{XML_NS}}}id": next_id()
-                })
-                p = etree.SubElement(note_elem, f"{{{DOCBOOK_NS}}}para", attrib={f"{{{XML_NS}}}id": next_id()})
-                if not page_pi_added:
-                    p.append(page_pi)
-                    page_pi_added = True
-                append_styled_spans_to_node(p, block["spans"])
-                prev_block_type = "note"
             elif b_type == "blockquote":
                 bq = etree.SubElement(active_parent, f"{{{DOCBOOK_NS}}}blockquote", attrib={f"{{{XML_NS}}}id": next_id()})
                 p = etree.SubElement(bq, f"{{{DOCBOOK_NS}}}para", attrib={f"{{{XML_NS}}}id": next_id()})
                 if not page_pi_added:
                     p.append(page_pi)
                     page_pi_added = True
-                append_styled_spans_to_node(p, block["spans"])
+                append_styled_spans_to_node(p, block["spans"], note_factory=make_footnote)
                 prev_block_type = "blockquote"
             elif b_type == "sidebar":
                 sb = etree.SubElement(active_parent, f"{{{DOCBOOK_NS}}}sidebar", attrib={f"{{{XML_NS}}}id": next_id()})
@@ -614,7 +802,7 @@ def parse_full_pdf(pdf_path, output_xml_path, doi, book_title, status_callback=N
                 if not page_pi_added:
                     p.append(page_pi)
                     page_pi_added = True
-                append_styled_spans_to_node(p, block["spans"])
+                append_styled_spans_to_node(p, block["spans"], note_factory=make_footnote)
                 prev_block_type = "sidebar"
             else:
                 is_full_out = (prev_block_type in ("chap_title", "heading", "blockquote", "sidebar", "figure")) or (not block.get("is_indented", True))
@@ -625,8 +813,12 @@ def parse_full_pdf(pdf_path, output_xml_path, doi, book_title, status_callback=N
                 if not page_pi_added:
                     p.append(page_pi)
                     page_pi_added = True
-                append_styled_spans_to_node(p, block["spans"])
+                append_styled_spans_to_node(p, block["spans"], note_factory=make_footnote)
                 prev_block_type = "para"
+
+    if status_callback:
+        status_callback("Linking superscript callouts to their notes...")
+    note_stats = attach_notes(callouts, note_groups)
 
     if status_callback:
         status_callback("Normalizing hexadecimal entities and XML formatting...")
@@ -651,6 +843,7 @@ def parse_full_pdf(pdf_path, output_xml_path, doi, book_title, status_callback=N
 
     if status_callback:
         status_callback("Ready")
+    return note_stats
 
 class UniversalConverterApp(tk.Tk):
     def __init__(self):
@@ -747,16 +940,21 @@ class UniversalConverterApp(tk.Tk):
 
     def run_conversion_worker(self, pdf_path, out_fn, doi, title):
         try:
-            parse_full_pdf(pdf_path, out_fn, doi, title, status_callback=self.set_status)
-            self.after(0, lambda: self.on_conversion_success(out_fn))
+            stats = parse_full_pdf(pdf_path, out_fn, doi, title, status_callback=self.set_status)
+            self.after(0, lambda: self.on_conversion_success(out_fn, stats))
         except Exception as e:
             self.after(0, lambda: self.on_conversion_error(str(e)))
 
-    def on_conversion_success(self, out_fn):
+    def on_conversion_success(self, out_fn, stats=None):
         self.prog_bar.stop()
         self.status_label.config(text="Ready")
         self.btn.config(state="normal", text="Generate DocBook XML")
-        messagebox.showinfo("Success", f"DocBook XML generated successfully!\n\nSaved to:\n{out_fn}")
+        extra = ""
+        if stats:
+            extra = (f"\n\nFootnotes: {stats['callouts']} callouts, {stats['notes']} notes"
+                     f"\nCallouts without a note: {stats['unmatched_callouts']}"
+                     f"\nNotes without a callout: {stats['unused_notes']}")
+        messagebox.showinfo("Success", f"DocBook XML generated successfully!\n\nSaved to:\n{out_fn}{extra}")
 
     def on_conversion_error(self, err_msg):
         self.prog_bar.stop()
